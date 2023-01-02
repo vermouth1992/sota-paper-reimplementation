@@ -9,6 +9,7 @@ For each algorithm, we implement:
 
 ## Code Structure
 This repo is not meant to build a library. 
-Thus, we keep one algorithm per folder with specific environment requirements.txt that generated the reproduced results.
+Thus, we keep one algorithm per folder with specific environment requirements.txt that generated the reproduced results. 
+This causes rewriting codes with similar functionalities many times in various algorithms.
 
 ## Reimplemented Algorithms
