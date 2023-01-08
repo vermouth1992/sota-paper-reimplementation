@@ -6,16 +6,22 @@ import torch.nn as nn
 import torch.optim
 from tqdm.auto import trange
 
-import rlutils.gym
-import rlutils.infra as rl_infra
-import rlutils.pytorch as rlu
-import rlutils.pytorch.utils as ptu
-from rlutils.interface.agent import Agent
-from rlutils.logx import EpochLogger, setup_logger_kwargs
-from rlutils.replay_buffers import UniformReplayBuffer
+import d4rl
+from library import pytorch_utils as ptu
+from library.gym_utils import verify_continuous_action_space
+from library.infrastructure.logger import EpochLogger, setup_logger_kwargs
+from library.infrastructure.seeder import Seeder
+from library.infrastructure.tester import D4RLTester
+from library.infrastructure.timer import StopWatch
+from library.nn.layers import LagrangeLayer
+from library.nn.model import SquashedGaussianMLPActor, EnsembleMinQNet
+from library.replay_buffer import UniformReplayBuffer
+from library.rl_functional import soft_update, hard_update
+
+LOG_2 = 0.6931471805599453
 
 
-class CQLContinuousAgent(Agent, nn.Module):
+class CQLContinuousAgent(nn.Module):
     def __init__(self,
                  env,
                  policy_mlp_hidden=128,
@@ -33,27 +39,26 @@ class CQLContinuousAgent(Agent, nn.Module):
                  target_entropy=None,
                  device=None
                  ):
-        nn.Module.__init__(self)
-        Agent.__init__(self, env=env)
+        super().__init__()
         self.obs_spec = env.observation_space
         self.act_spec = env.action_space
         self.num_samples = num_samples
         self.act_dim = self.act_spec.shape[0]
         if len(self.obs_spec.shape) == 1:  # 1D observation
             self.obs_dim = self.obs_spec.shape[0]
-            self.policy_net = rlu.nn.SquashedGaussianMLPActor(self.obs_dim, self.act_dim, policy_mlp_hidden)
+            self.policy_net = SquashedGaussianMLPActor(self.obs_dim, self.act_dim, policy_mlp_hidden)
             self.target_policy_net = copy.deepcopy(self.policy_net)
-            self.q_network = rlu.nn.EnsembleMinQNet(self.obs_dim, self.act_dim, q_mlp_hidden)
+            self.q_network = EnsembleMinQNet(self.obs_dim, self.act_dim, q_mlp_hidden)
             self.target_q_network = copy.deepcopy(self.q_network)
         else:
             raise NotImplementedError
-        rlu.functional.hard_update(self.target_q_network, self.q_network)
+        hard_update(self.target_q_network, self.q_network)
 
         self.policy_optimizer = torch.optim.Adam(params=self.policy_net.parameters(), lr=policy_lr)
         self.q_optimizer = torch.optim.Adam(params=self.q_network.parameters(), lr=q_lr)
 
-        self.log_alpha = rlu.nn.LagrangeLayer(initial_value=alpha)
-        self.log_cql = rlu.nn.LagrangeLayer(initial_value=alpha_cql)
+        self.log_alpha = LagrangeLayer(initial_value=alpha)
+        self.log_cql = LagrangeLayer(initial_value=alpha_cql)
         self.alpha_optimizer = torch.optim.Adam(params=self.log_alpha.parameters(), lr=alpha_lr)
         self.cql_alpha_optimizer = torch.optim.Adam(params=self.log_cql.parameters(), lr=alpha_cql_lr)
 
@@ -68,6 +73,8 @@ class CQLContinuousAgent(Agent, nn.Module):
         self.device = device
         self.to(self.device)
 
+        self.logger = None
+
     def log_tabular(self):
         self.logger.log_tabular('Q1Vals', with_min_and_max=True)
         self.logger.log_tabular('Q2Vals', with_min_and_max=True)
@@ -81,16 +88,16 @@ class CQLContinuousAgent(Agent, nn.Module):
         self.logger.log_tabular('DeltaCQL', with_min_and_max=True)
 
     def update_target(self):
-        rlu.functional.soft_update(self.target_q_network, self.q_network, self.tau)
-        rlu.functional.soft_update(self.target_policy_net, self.policy_net, self.tau)
+        soft_update(self.target_q_network, self.q_network, self.tau)
+        soft_update(self.target_policy_net, self.policy_net, self.tau)
 
     def _compute_next_obs_q(self, next_obs, max_backup=True):
         """ Max backup """
         with torch.no_grad():
             batch_size = next_obs.shape[0]
             next_obs = torch.tile(next_obs, (self.num_samples, 1))
-            actions = self.target_policy_net.select_action((next_obs, False))
-            q_values = self.target_q_network(inputs=(next_obs, actions), training=False)
+            actions = self.target_policy_net.select_action(obs=next_obs, deterministic=False)
+            q_values = self.target_q_network(obs=next_obs, act=actions, take_min=True)
             q_values = torch.reshape(q_values, (self.num_samples, batch_size))  # (num_samples, None)
             if max_backup:
                 q_values = torch.max(q_values, dim=0)[0]
@@ -105,32 +112,45 @@ class CQLContinuousAgent(Agent, nn.Module):
             alpha_cql = self.log_cql()
             batch_size = obs.shape[0]
             next_q_values = self._compute_next_obs_q(next_obs, max_backup=self.max_backup)
-            q_target = rlu.functional.compute_target_value(rew, self.gamma, done, next_q_values)
+
+            q_target = rew + self.gamma * (1.0 - done) * next_q_values
 
         # q loss
         self.q_optimizer.zero_grad()
-        q_values = self.q_network((obs, act), training=True)
+        q_values = self.q_network(obs=obs, act=act, take_min=False)
         mse_q_values_loss = 0.5 * torch.square(torch.unsqueeze(q_target, dim=0) - q_values)  # (num_ensembles, None)
         mse_q_values_loss = torch.mean(torch.sum(mse_q_values_loss, dim=0), dim=0)  # scalar
 
         # in-distribution q values is simply q_values
-        # max_a Q(s,a)
+        in_distribution_q_values = torch.min(q_values, dim=0)[0]
+
+        # max_a Q(s,a). Current Q values
         with torch.no_grad():
             obs_tile = torch.tile(obs, (self.num_samples, 1))
-            actions, log_prob, _, _ = self.policy_net((obs_tile, False))  # (num_samples * None, act_dim)
-        cql_q_values_pi = self.q_network((obs_tile, actions), training=False) - log_prob  # (num_samples * None)
-        cql_q_values_pi = torch.reshape(cql_q_values_pi, shape=(self.num_samples, batch_size))
+            next_obs_tile = torch.tile(next_obs, (self.num_samples, 1))
 
-        pi_random_actions = torch.rand(size=(self.num_samples * batch_size, self.act_dim),
-                                       device=self.device) * 2. - 1.  # [-1., 1]
-        log_prob_random = -np.log(2.)  # uniform distribution from [-1, 1], prob=0.5
-        cql_q_values_random = self.q_network((obs_tile, pi_random_actions), training=False) - log_prob_random
-        cql_q_values_random = torch.reshape(cql_q_values_random, shape=(self.num_samples, batch_size))
+            # current actions
+            actions, log_prob, _, _ = self.policy_net(obs=obs_tile,
+                                                      deterministic=False)  # (num_samples * None, act_dim)
 
-        cql_q_values = torch.cat((cql_q_values_pi, cql_q_values_random), dim=0)  # (2 * num_samples, None)
-        cql_q_values = torch.logsumexp(cql_q_values, dim=0) - np.log(2 * self.num_samples)
+            # next_obs actions
+            next_obs_actions, next_obs_log_prob, _, _ = self.policy_net(obs=next_obs_tile, deterministic=False)
 
-        cql_threshold = torch.mean(cql_q_values - torch.min(q_values, dim=0)[0].detach(), dim=0)
+            # random actions
+            pi_random_actions = torch.rand(size=(self.num_samples * batch_size, self.act_dim),
+                                           device=self.device) * 2. - 1.  # [-1., 1]
+            log_prob_random = torch.ones_like(log_prob) * -LOG_2  # uniform distribution from [-1, 1], prob=0.5
+
+        obs_tile_tile = torch.cat((obs_tile, obs_tile, obs_tile), dim=0)
+        act_tile_tile = torch.cat((actions, next_obs_actions, pi_random_actions), dim=0)
+        log_prob_tile_tile = torch.cat((log_prob, next_obs_log_prob, log_prob_random), dim=0)
+
+        # shape (3 * num_samples, None)
+        cql_q_values = self.q_network(obs=obs_tile_tile, act=act_tile_tile, take_min=True) - log_prob_tile_tile
+        cql_q_values = torch.reshape(cql_q_values, shape=(3 * self.num_samples, batch_size))  # (3 * num_samples, None)
+
+        cql_q_values = torch.logsumexp(cql_q_values, dim=0)
+        cql_threshold = torch.mean(cql_q_values - in_distribution_q_values, dim=0)
 
         q_loss = mse_q_values_loss + alpha_cql * cql_threshold
         q_loss.backward()
@@ -147,11 +167,11 @@ class CQLContinuousAgent(Agent, nn.Module):
         # update policy
         self.policy_optimizer.zero_grad()
         if behavior_cloning:
-            log_prob_data, log_prob = self.policy_net.compute_log_prob((obs, act))
+            log_prob_data, log_prob = self.policy_net.compute_log_prob(obs=obs, act=act)
             policy_loss = torch.mean(log_prob * alpha - log_prob_data, dim=0)
         else:
             action, log_prob, _, _ = self.policy_net((obs, False))
-            q_values_pi_min = self.q_network((obs, action), training=False)
+            q_values_pi_min = self.q_network(obs=obs, act=action, take_min=True)
             policy_loss = torch.mean(log_prob * alpha - q_values_pi_min, dim=0)
 
         policy_loss.backward()
@@ -206,21 +226,6 @@ class CQLContinuousAgent(Agent, nn.Module):
             return actions
 
 
-class Tester(rl_infra.Tester):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.dummy_env = self.env_fn()
-
-    def test_agent(self, **kwargs):
-        ep_ret, ep_len = super().test_agent(**kwargs)
-        normalized_ep_ret = self.dummy_env.get_normalized_score(ep_ret) * 100
-        self.logger.store(NormalizedTestEpRet=normalized_ep_ret)
-
-    def log_tabular(self):
-        self.logger.log_tabular('NormalizedTestEpRet', with_min_and_max=True)
-        super().log_tabular()
-
-
 def run_d4rl_cql(env_name: str,
                  exp_name: str = None,
                  asynchronous=False,
@@ -245,17 +250,16 @@ def run_d4rl_cql(env_name: str,
     config = locals()
 
     # setup seed
-    seeder = rl_infra.Seeder(seed=seed, backend='torch')
+    seeder = Seeder(seed=seed, backend='torch')
     seeder.setup_global_seed()
 
     # environment
     env_fn = lambda: gym.make(env_name)
-    env_fn = rlutils.gym.utils.wrap_env_fn(env_fn, truncate_obs_dtype=True, normalize_action_space=True)
 
     # agent
     env = env_fn()
+    verify_continuous_action_space(env.action_space)
 
-    import d4rl
     dataset = d4rl.qlearning_dataset(env)
     dataset['obs'] = dataset.pop('observations').astype(np.float32)
     dataset['act'] = dataset.pop('actions').astype(np.float32)
@@ -266,29 +270,28 @@ def run_d4rl_cql(env_name: str,
     agent = CQLContinuousAgent(env=env, policy_lr=policy_lr, policy_mlp_hidden=policy_mlp_hidden,
                                q_mlp_hidden=q_mlp_hidden, q_lr=q_lr, alpha=alpha,
                                tau=tau, gamma=gamma, cql_threshold=cql_threshold,
-                               device=ptu.get_cuda_device())
+                               device=ptu.get_accelerator())
 
     # setup logger
     if exp_name is None:
         exp_name = f'{env_name}_{agent.__class__.__name__}_test'
-    assert exp_name is not None, 'Call setup_env before setup_logger if exp passed by the contructor is None.'
     logger_kwargs = setup_logger_kwargs(exp_name=exp_name, data_dir=logger_path, seed=seed)
     logger = EpochLogger(**logger_kwargs, tensorboard=False)
     logger.save_config(config)
 
-    timer = rl_infra.StopWatch()
+    timer = StopWatch()
 
     # replay buffer
     replay_buffer = UniformReplayBuffer.from_dataset(dataset=dataset, seed=seeder.generate_seed())
 
     # setup tester
-    tester = Tester(env_fn=env_fn, num_parallel_env=num_test_episodes,
-                    asynchronous=asynchronous, seed=seeder.generate_seed())
+    tester = D4RLTester(env_fn=env_fn, num_parallel_env=num_test_episodes,
+                        asynchronous=asynchronous, seed=seeder.generate_seed())
 
     # register log_tabular args
-    timer.set_logger(logger=logger)
-    agent.set_logger(logger=logger)
-    tester.set_logger(logger=logger)
+    timer.logger = logger
+    agent.logger = logger
+    tester.logger = logger
 
     timer.start()
     policy_updates = 0
@@ -310,6 +313,6 @@ def run_d4rl_cql(env_name: str,
 
 
 if __name__ == '__main__':
-    from rlutils.infra.runner import run_func_as_main
+    from library.infrastructure.commandline_utils import run_func_as_main
 
     run_func_as_main(func=run_d4rl_cql)
