@@ -54,3 +54,4 @@ class Seeder(object):
         torch.random.manual_seed(self.generate_seed())
         torch.cuda.manual_seed_all(self.generate_seed())
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True

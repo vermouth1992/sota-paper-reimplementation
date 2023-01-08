@@ -185,4 +185,4 @@ class UniformReplayBuffer(object):
         replay_buffer = cls(data_spec=data_spec, capacity=capacity, **kwargs)
         replay_buffer.add(dataset)
         assert replay_buffer.is_full()
-        return
+        return replay_buffer

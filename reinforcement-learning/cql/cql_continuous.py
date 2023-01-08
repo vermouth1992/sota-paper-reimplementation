@@ -8,7 +8,7 @@ from tqdm.auto import trange
 
 import d4rl
 from library import pytorch_utils as ptu
-from library.gym_utils import verify_continuous_action_space
+from library.gym_utils import verify_continuous_action_space, TransformObservationDtype
 from library.infrastructure.logger import EpochLogger, setup_logger_kwargs
 from library.infrastructure.seeder import Seeder
 from library.infrastructure.tester import D4RLTester
@@ -28,9 +28,9 @@ class CQLContinuousAgent(nn.Module):
                  policy_lr=3e-4,
                  q_mlp_hidden=256,
                  q_lr=3e-4,
-                 alpha=1.0,
+                 alpha=0.2,
                  alpha_lr=1e-3,
-                 alpha_cql=1.,
+                 alpha_cql=0.2,
                  alpha_cql_lr=1e-3,
                  tau=5e-3,
                  gamma=0.99,
@@ -47,7 +47,6 @@ class CQLContinuousAgent(nn.Module):
         if len(self.obs_spec.shape) == 1:  # 1D observation
             self.obs_dim = self.obs_spec.shape[0]
             self.policy_net = SquashedGaussianMLPActor(self.obs_dim, self.act_dim, policy_mlp_hidden)
-            self.target_policy_net = copy.deepcopy(self.policy_net)
             self.q_network = EnsembleMinQNet(self.obs_dim, self.act_dim, q_mlp_hidden)
             self.target_q_network = copy.deepcopy(self.q_network)
         else:
@@ -58,7 +57,7 @@ class CQLContinuousAgent(nn.Module):
         self.q_optimizer = torch.optim.Adam(params=self.q_network.parameters(), lr=q_lr)
 
         self.log_alpha = LagrangeLayer(initial_value=alpha)
-        self.log_cql = LagrangeLayer(initial_value=alpha_cql)
+        self.log_cql = LagrangeLayer(initial_value=alpha_cql, max_value=100.)
         self.alpha_optimizer = torch.optim.Adam(params=self.log_alpha.parameters(), lr=alpha_lr)
         self.cql_alpha_optimizer = torch.optim.Adam(params=self.log_cql.parameters(), lr=alpha_cql_lr)
 
@@ -89,14 +88,13 @@ class CQLContinuousAgent(nn.Module):
 
     def update_target(self):
         soft_update(self.target_q_network, self.q_network, self.tau)
-        soft_update(self.target_policy_net, self.policy_net, self.tau)
 
     def _compute_next_obs_q(self, next_obs, max_backup=True):
         """ Max backup """
         with torch.no_grad():
             batch_size = next_obs.shape[0]
             next_obs = torch.tile(next_obs, (self.num_samples, 1))
-            actions = self.target_policy_net.select_action(obs=next_obs, deterministic=False)
+            actions = self.policy_net.select_action(obs=next_obs, deterministic=False)
             q_values = self.target_q_network(obs=next_obs, act=actions, take_min=True)
             q_values = torch.reshape(q_values, (self.num_samples, batch_size))  # (num_samples, None)
             if max_backup:
@@ -105,7 +103,15 @@ class CQLContinuousAgent(nn.Module):
                 q_values = torch.mean(q_values, dim=0)
             return q_values
 
-    def train_nets_cql_pytorch(self, obs, act, next_obs, rew, done, behavior_cloning):
+    def train_nets_behavior_cloning(self, obs, act):
+        self.policy_optimizer.zero_grad(set_to_none=True)
+        log_prob_data, _ = self.policy_net.compute_log_prob(obs=obs, act=act)
+        policy_loss = torch.mean(-log_prob_data, dim=0)
+        policy_loss.backward()
+        self.policy_optimizer.step()
+        return policy_loss
+
+    def train_nets_cql_pytorch(self, obs, act, next_obs, rew, done):
         # update
         with torch.no_grad():
             alpha = self.log_alpha()
@@ -116,7 +122,7 @@ class CQLContinuousAgent(nn.Module):
             q_target = rew + self.gamma * (1.0 - done) * next_q_values
 
         # q loss
-        self.q_optimizer.zero_grad()
+        self.q_optimizer.zero_grad(set_to_none=True)
         q_values = self.q_network(obs=obs, act=act, take_min=False)
         mse_q_values_loss = 0.5 * torch.square(torch.unsqueeze(q_target, dim=0) - q_values)  # (num_ensembles, None)
         mse_q_values_loss = torch.mean(torch.sum(mse_q_values_loss, dim=0), dim=0)  # scalar
@@ -157,7 +163,7 @@ class CQLContinuousAgent(nn.Module):
         self.q_optimizer.step()
 
         # update alpha_cql
-        self.cql_alpha_optimizer.zero_grad()
+        self.cql_alpha_optimizer.zero_grad(set_to_none=True)
         alpha_cql = self.log_cql()
         delta_cql = cql_threshold - self.cql_threshold
         alpha_cql_loss = -alpha_cql * delta_cql.detach()
@@ -165,21 +171,16 @@ class CQLContinuousAgent(nn.Module):
         self.cql_alpha_optimizer.step()
 
         # update policy
-        self.policy_optimizer.zero_grad()
-        if behavior_cloning:
-            log_prob_data, log_prob = self.policy_net.compute_log_prob(obs=obs, act=act)
-            policy_loss = torch.mean(log_prob * alpha - log_prob_data, dim=0)
-        else:
-            action, log_prob, _, _ = self.policy_net((obs, False))
-            q_values_pi_min = self.q_network(obs=obs, act=action, take_min=True)
-            policy_loss = torch.mean(log_prob * alpha - q_values_pi_min, dim=0)
-
+        self.policy_optimizer.zero_grad(set_to_none=True)
+        action, log_prob, _, _ = self.policy_net(obs=obs, deterministic=False)
+        q_values_pi_min = self.q_network(obs=obs, act=action, take_min=True)
+        policy_loss = torch.mean(log_prob * alpha - q_values_pi_min, dim=0)
         policy_loss.backward()
         self.policy_optimizer.step()
 
         alpha = self.log_alpha()
         alpha_loss = -torch.mean(alpha * (log_prob.detach() + self.target_entropy))
-        self.alpha_optimizer.zero_grad()
+        self.alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
@@ -197,14 +198,11 @@ class CQLContinuousAgent(nn.Module):
         )
         return info
 
-    def train_on_batch(self, data, behavior_cloning=False):
+    def train_on_batch(self, data):
         data = ptu.convert_dict_to_tensor(data, self.device)
-        info = self.train_nets_cql_pytorch(**data, behavior_cloning=behavior_cloning)
+        info = self.train_nets_cql_pytorch(**data)
         self.update_target()
         self.logger.store(**info)
-
-    def act_batch_explore(self, obs, global_steps):
-        raise NotImplementedError
 
     def act_batch_test(self, obs):
         obs = torch.as_tensor(obs).to(self.device)
@@ -214,8 +212,8 @@ class CQLContinuousAgent(nn.Module):
         with torch.no_grad():
             batch_size = obs.shape[0]
             obs_tile = torch.tile(obs, (self.num_samples, 1))
-            actions = self.policy_net.select_action((obs_tile, False))  # (num_samples * None, act_dim)
-            q_values = self.q_network((obs_tile, actions), training=False)  # (num_samples * None)
+            actions = self.policy_net.select_action(obs=obs_tile, deterministic=False)  # (num_samples * None, act_dim)
+            q_values = self.q_network(obs=obs_tile, act=actions, take_min=True)  # (num_samples * None)
             q_values = torch.reshape(q_values, shape=(self.num_samples, batch_size))
             max_idx = torch.max(q_values, dim=0)[1]  # (None)
             max_idx = torch.tile(max_idx, (self.act_dim,))  # (None * act_dim,)
@@ -226,6 +224,33 @@ class CQLContinuousAgent(nn.Module):
             return actions
 
 
+from torch.utils import data
+from typing import Dict
+import torch
+
+
+class DictDataset(data.Dataset):
+    def __init__(self, tensors: Dict[str, torch.Tensor]):
+        self.tensors = tensors
+        self.batch_size = None
+        for key, tensor in tensors.items():
+            if self.batch_size is None:
+                self.batch_size = tensor.shape[0]
+            else:
+                assert self.batch_size == tensor.shape[0]
+
+    def __getitem__(self, item):
+        return {key: data[item] for key, data in self.tensors.items()}
+
+    def __len__(self):
+        return self.batch_size
+
+
+def create_dict_data_loader(tensors: Dict[str, torch.Tensor], batch_size):
+    dataset = DictDataset(tensors)
+    return data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+
+
 def run_d4rl_cql(env_name: str,
                  exp_name: str = None,
                  asynchronous=False,
@@ -234,17 +259,17 @@ def run_d4rl_cql(env_name: str,
                  policy_lr=3e-5,
                  q_mlp_hidden=256,
                  q_lr=3e-4,
-                 alpha=0.2,
+                 alpha=0.02,
                  tau=5e-3,
                  gamma=0.99,
-                 cql_threshold=-5.,
+                 cql_threshold=-5,
                  # runner args
                  epochs=250,
                  steps_per_epoch=4000,
                  num_test_episodes=30,
                  batch_size=256,
                  seed=1,
-                 behavior_cloning_steps=20000,
+                 behavior_cloning_epochs=10,
                  logger_path: str = None
                  ):
     config = locals()
@@ -254,7 +279,10 @@ def run_d4rl_cql(env_name: str,
     seeder.setup_global_seed()
 
     # environment
-    env_fn = lambda: gym.make(env_name)
+    def env_fn():
+        env = gym.make(env_name)
+        env = TransformObservationDtype(env, dtype=np.float32)
+        return env
 
     # agent
     env = env_fn()
@@ -266,6 +294,11 @@ def run_d4rl_cql(env_name: str,
     dataset['next_obs'] = dataset.pop('next_observations').astype(np.float32)
     dataset['rew'] = dataset.pop('rewards').astype(np.float32)
     dataset['done'] = dataset.pop('terminals').astype(np.float32)
+
+    # normalized reward to [0, 1]
+    max_reward = np.max(dataset['rew'])
+    min_reward = np.min(dataset['rew'])
+    dataset['rew'] = (dataset['rew'] - min_reward) / (max_reward - min_reward)
 
     agent = CQLContinuousAgent(env=env, policy_lr=policy_lr, policy_mlp_hidden=policy_mlp_hidden,
                                q_mlp_hidden=q_mlp_hidden, q_lr=q_lr, alpha=alpha,
@@ -293,14 +326,49 @@ def run_d4rl_cql(env_name: str,
     agent.logger = logger
     tester.logger = logger
 
+    logger.register(tester.log_tabular)
+    logger.register(timer.log_tabular)
+    logger.register(agent.log_tabular)
+
     timer.start()
+    behavior_cloning_steps = behavior_cloning_epochs * steps_per_epoch
     policy_updates = 0
 
+    # fit via behavior cloning and compute the entropy
+    t = trange(behavior_cloning_steps)
+    for i in t:
+        batch = replay_buffer.sample(batch_size)
+        data = dict(
+            obs=batch['obs'],
+            act=batch['act']
+        )
+        data = ptu.convert_dict_to_tensor(data, device=agent.device)
+        policy_loss = agent.train_nets_behavior_cloning(**data)
+        if i % 1000 == 0:
+            t.set_description(f'log_prob: {policy_loss:.2f}')
+
+    # set the target entropy
+    dataloader = create_dict_data_loader({'obs': dataset['obs'], 'act': dataset['act']}, batch_size=2000)
+    log_prob_lst = []
+    with torch.no_grad():
+        for data in dataloader:
+            data = ptu.convert_dict_to_tensor(data, device=agent.device)
+            log_prob, _ = agent.policy_net.compute_log_prob(**data)
+            log_prob_lst.append(log_prob)
+
+    log_prob_lst = torch.cat(log_prob_lst, dim=0)
+    log_prob = torch.mean(log_prob_lst, dim=0)
+    target_entropy = -log_prob * 2
+
+    agent.target_entropy = target_entropy
+    print(f'Setting target_entropy {target_entropy}')
+
+    # main training loop
     for epoch in range(1, epochs + 1):
         for t in trange(steps_per_epoch, desc=f'Epoch {epoch}/{epochs}'):
             # Update handling
             batch = replay_buffer.sample(batch_size)
-            agent.train_on_batch(data=batch, behavior_cloning=policy_updates < behavior_cloning_steps)
+            agent.train_on_batch(data=batch)
             policy_updates += 1
 
         tester.test_agent(get_action=lambda obs: agent.act_batch_test(obs),
