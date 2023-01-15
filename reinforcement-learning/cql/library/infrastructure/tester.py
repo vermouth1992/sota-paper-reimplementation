@@ -1,8 +1,8 @@
 import time
 
+import gym
 import numpy as np
 from tqdm.auto import tqdm
-import gym
 
 
 class Tester(object):
@@ -54,8 +54,10 @@ class Tester(object):
         start = time.time()
         already_timeout = False
 
+        self.test_env.seed(self.seed)
+
         for _ in range(num_iterations):
-            o = self.test_env.reset(seed=self.seed)  # keep evaluating the same random obs
+            o = self.test_env.reset()  # keep evaluating the same random obs
             d = np.zeros(shape=self.test_env.num_envs, dtype=np.bool_)
             ep_ret = np.zeros(shape=self.test_env.num_envs, dtype=np.float64)
             ep_len = np.zeros(shape=self.test_env.num_envs, dtype=np.int64)
