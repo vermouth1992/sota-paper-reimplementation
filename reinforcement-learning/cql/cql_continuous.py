@@ -35,7 +35,10 @@ class CQLContinuousAgent(nn.Module):
                  tau=5e-3,
                  gamma=0.99,
                  num_samples=10,
-                 cql_threshold=1.,
+                 # cql related
+                 cql_threshold=-1.,
+                 temperature=1.,
+                 min_q_weight=1.,
                  target_entropy=None,
                  device=None
                  ):
@@ -44,10 +47,11 @@ class CQLContinuousAgent(nn.Module):
         self.act_spec = env.action_space
         self.num_samples = num_samples
         self.act_dim = self.act_spec.shape[0]
+        self.num_ensembles = 2
         if len(self.obs_spec.shape) == 1:  # 1D observation
             self.obs_dim = self.obs_spec.shape[0]
             self.policy_net = SquashedGaussianMLPActor(self.obs_dim, self.act_dim, policy_mlp_hidden)
-            self.q_network = EnsembleMinQNet(self.obs_dim, self.act_dim, q_mlp_hidden)
+            self.q_network = EnsembleMinQNet(self.obs_dim, self.act_dim, q_mlp_hidden, num_ensembles=self.num_ensembles)
             self.target_q_network = copy.deepcopy(self.q_network)
         else:
             raise NotImplementedError
@@ -57,12 +61,14 @@ class CQLContinuousAgent(nn.Module):
         self.q_optimizer = torch.optim.Adam(params=self.q_network.parameters(), lr=q_lr)
 
         self.log_alpha = LagrangeLayer(initial_value=alpha)
-        self.log_cql = LagrangeLayer(initial_value=alpha_cql, max_value=100.)
+        self.log_cql = LagrangeLayer(initial_value=alpha_cql)
         self.alpha_optimizer = torch.optim.Adam(params=self.log_alpha.parameters(), lr=alpha_lr)
         self.cql_alpha_optimizer = torch.optim.Adam(params=self.log_cql.parameters(), lr=alpha_cql_lr)
 
         self.target_entropy = -self.act_dim if target_entropy is None else target_entropy
         self.cql_threshold = cql_threshold
+        self.temperature = temperature
+        self.min_q_weight = min_q_weight
 
         self.tau = tau
         self.gamma = gamma
@@ -128,7 +134,7 @@ class CQLContinuousAgent(nn.Module):
         mse_q_values_loss = torch.mean(torch.sum(mse_q_values_loss, dim=0), dim=0)  # scalar
 
         # in-distribution q values is simply q_values
-        in_distribution_q_values = torch.min(q_values, dim=0)[0]
+        in_distribution_q_values = q_values  # (num_ensembles, None)
 
         # max_a Q(s,a). Current Q values
         with torch.no_grad():
@@ -145,18 +151,21 @@ class CQLContinuousAgent(nn.Module):
             # random actions
             pi_random_actions = torch.rand(size=(self.num_samples * batch_size, self.act_dim),
                                            device=self.device) * 2. - 1.  # [-1., 1]
-            log_prob_random = torch.ones_like(log_prob) * -LOG_2  # uniform distribution from [-1, 1], prob=0.5
+            log_prob_random = torch.ones_like(log_prob) * -LOG_2 * self.act_dim  # uniform from [-1, 1], prob=0.5
 
         obs_tile_tile = torch.cat((obs_tile, obs_tile, obs_tile), dim=0)
         act_tile_tile = torch.cat((actions, next_obs_actions, pi_random_actions), dim=0)
         log_prob_tile_tile = torch.cat((log_prob, next_obs_log_prob, log_prob_random), dim=0)
 
         # shape (3 * num_samples, None)
-        cql_q_values = self.q_network(obs=obs_tile_tile, act=act_tile_tile, take_min=True) - log_prob_tile_tile
-        cql_q_values = torch.reshape(cql_q_values, shape=(3 * self.num_samples, batch_size))  # (3 * num_samples, None)
+        log_prob_tile_tile = torch.unsqueeze(log_prob_tile_tile, dim=0)
+        cql_q_values = self.q_network(obs=obs_tile_tile, act=act_tile_tile, take_min=False) - log_prob_tile_tile
 
-        cql_q_values = torch.logsumexp(cql_q_values, dim=0)
-        cql_threshold = torch.mean(cql_q_values - in_distribution_q_values, dim=0)
+        # (3 * num_samples, None)
+        cql_q_values = torch.reshape(cql_q_values, shape=(self.num_ensembles, 3 * self.num_samples, batch_size))
+        # (num_ensemble, None)
+        cql_q_values = torch.logsumexp(cql_q_values / self.temperature, dim=1) * self.temperature
+        cql_threshold = torch.mean(torch.sum(cql_q_values - in_distribution_q_values, dim=0), dim=0) * self.min_q_weight
 
         q_loss = mse_q_values_loss + alpha_cql * cql_threshold
         q_loss.backward()
@@ -224,45 +233,20 @@ class CQLContinuousAgent(nn.Module):
             return actions
 
 
-from torch.utils import data
-from typing import Dict
-import torch
-
-
-class DictDataset(data.Dataset):
-    def __init__(self, tensors: Dict[str, torch.Tensor]):
-        self.tensors = tensors
-        self.batch_size = None
-        for key, tensor in tensors.items():
-            if self.batch_size is None:
-                self.batch_size = tensor.shape[0]
-            else:
-                assert self.batch_size == tensor.shape[0]
-
-    def __getitem__(self, item):
-        return {key: data[item] for key, data in self.tensors.items()}
-
-    def __len__(self):
-        return self.batch_size
-
-
-def create_dict_data_loader(tensors: Dict[str, torch.Tensor], batch_size):
-    dataset = DictDataset(tensors)
-    return data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
-
-
 def run_d4rl_cql(env_name: str,
                  exp_name: str = None,
                  asynchronous=False,
                  # agent
                  policy_mlp_hidden=256,
-                 policy_lr=3e-5,
+                 policy_lr=1e-4,
                  q_mlp_hidden=256,
                  q_lr=3e-4,
                  alpha=0.02,
                  tau=5e-3,
                  gamma=0.99,
-                 cql_threshold=-5,
+                 cql_threshold=-1,
+                 temperature=1.,
+                 min_q_weight=1.,
                  # runner args
                  epochs=250,
                  steps_per_epoch=4000,
@@ -303,6 +287,7 @@ def run_d4rl_cql(env_name: str,
     agent = CQLContinuousAgent(env=env, policy_lr=policy_lr, policy_mlp_hidden=policy_mlp_hidden,
                                q_mlp_hidden=q_mlp_hidden, q_lr=q_lr, alpha=alpha,
                                tau=tau, gamma=gamma, cql_threshold=cql_threshold,
+                               temperature=temperature, min_q_weight=min_q_weight,
                                device=ptu.get_accelerator())
 
     # setup logger
@@ -321,13 +306,13 @@ def run_d4rl_cql(env_name: str,
     tester = D4RLTester(env_fn=env_fn, num_parallel_env=num_test_episodes,
                         asynchronous=asynchronous, seed=seeder.generate_seed())
 
-    # register log_tabular args
+    # register log_tabular ops
     timer.logger = logger
     agent.logger = logger
     tester.logger = logger
 
-    logger.register(tester.log_tabular)
     logger.register(timer.log_tabular)
+    logger.register(tester.log_tabular)
     logger.register(agent.log_tabular)
 
     timer.start()
@@ -346,22 +331,6 @@ def run_d4rl_cql(env_name: str,
         policy_loss = agent.train_nets_behavior_cloning(**data)
         if i % 1000 == 0:
             t.set_description(f'log_prob: {policy_loss:.2f}')
-
-    # set the target entropy
-    dataloader = create_dict_data_loader({'obs': dataset['obs'], 'act': dataset['act']}, batch_size=2000)
-    log_prob_lst = []
-    with torch.no_grad():
-        for data in dataloader:
-            data = ptu.convert_dict_to_tensor(data, device=agent.device)
-            log_prob, _ = agent.policy_net.compute_log_prob(**data)
-            log_prob_lst.append(log_prob)
-
-    log_prob_lst = torch.cat(log_prob_lst, dim=0)
-    log_prob = torch.mean(log_prob_lst, dim=0)
-    target_entropy = -log_prob * 2
-
-    agent.target_entropy = target_entropy
-    print(f'Setting target_entropy {target_entropy}')
 
     # main training loop
     for epoch in range(1, epochs + 1):

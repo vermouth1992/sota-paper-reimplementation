@@ -186,3 +186,38 @@ class UniformReplayBuffer(object):
         replay_buffer.add(dataset)
         assert replay_buffer.is_full()
         return replay_buffer
+
+
+from torch.utils import data
+from typing import Dict
+import torch
+
+
+class DictDataset(data.Dataset):
+    def __init__(self, tensors: Dict[str, torch.Tensor], subset_keys=None):
+        self.tensors = tensors
+        self.batch_size = None
+        if subset_keys is None:
+            self.subset_keys = tensors.keys()
+        else:
+            self.subset_keys = subset_keys
+
+        for key, tensor in tensors.items():
+            if self.batch_size is None:
+                self.batch_size = tensor.shape[0]
+            else:
+                assert self.batch_size == tensor.shape[0]
+
+        for key in self.subset_keys:
+            assert key in tensors.keys()
+
+    def __getitem__(self, item):
+        return {key: self.tensors[key][item] for key in self.subset_keys}
+
+    def __len__(self):
+        return self.batch_size
+
+
+def create_dict_data_loader(tensors: Dict[str, torch.Tensor], batch_size, subset_keys=None):
+    dataset = DictDataset(tensors, subset_keys=subset_keys)
+    return data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, pin_memory=True)

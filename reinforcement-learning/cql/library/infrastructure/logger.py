@@ -403,6 +403,14 @@ class EpochLogger(Logger):
         Lets an algorithm ask the logger for mean/std/min/max of a diagnostic.
         """
         v = self.epoch_dict[key]
+
+        if isinstance(v[0], np.ndarray):
+            v = np.concatenate(v, axis=0)
+        elif isinstance(v[0], torch.Tensor):
+            v = torch.cat(v, dim=0).cpu().numpy()
+        else:
+            raise ValueError(f'Unknown dtype {type(v[0])}')
+
         vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape) > 0 else v
         return statistics_scalar(vals)
 
