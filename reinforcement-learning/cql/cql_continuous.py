@@ -29,9 +29,9 @@ class CQLContinuousAgent(nn.Module):
                  q_mlp_hidden=256,
                  q_lr=3e-4,
                  alpha=0.2,
-                 alpha_lr=1e-3,
+                 alpha_lr=1e-2,
                  alpha_cql=0.2,
-                 alpha_cql_lr=1e-3,
+                 alpha_cql_lr=1e-2,
                  tau=5e-3,
                  gamma=0.99,
                  num_samples=10,
@@ -316,21 +316,20 @@ def run_d4rl_cql(env_name: str,
     logger.register(agent.log_tabular)
 
     timer.start()
-    behavior_cloning_steps = behavior_cloning_epochs * steps_per_epoch
     policy_updates = 0
 
     # fit via behavior cloning and compute the entropy
-    t = trange(behavior_cloning_steps)
-    for i in t:
-        batch = replay_buffer.sample(batch_size)
-        data = dict(
-            obs=batch['obs'],
-            act=batch['act']
-        )
-        data = ptu.convert_dict_to_tensor(data, device=agent.device)
-        policy_loss = agent.train_nets_behavior_cloning(**data)
-        if i % 1000 == 0:
-            t.set_description(f'log_prob: {policy_loss:.2f}')
+    from library.replay_buffer import create_dict_data_loader
+    from tqdm.auto import tqdm
+
+    data_loader = create_dict_data_loader(tensors=dataset,
+                                          batch_size=batch_size,
+                                          subset_keys={'obs', 'act'})
+
+    for epoch in range(1, behavior_cloning_epochs + 1):
+        for data in tqdm(data_loader, desc=f'Pretraining Epoch {epoch}/{behavior_cloning_epochs}'):
+            data = ptu.convert_dict_to_tensor(data, device=agent.device)
+            policy_loss = agent.train_nets_behavior_cloning(**data)
 
     # main training loop
     for epoch in range(1, epochs + 1):

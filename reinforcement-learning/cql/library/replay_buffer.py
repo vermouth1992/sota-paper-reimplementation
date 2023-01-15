@@ -219,5 +219,6 @@ class DictDataset(data.Dataset):
 
 
 def create_dict_data_loader(tensors: Dict[str, torch.Tensor], batch_size, subset_keys=None):
+    tensors = {key: torch.as_tensor(value) for key, value in tensors.items()}
     dataset = DictDataset(tensors, subset_keys=subset_keys)
     return data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
