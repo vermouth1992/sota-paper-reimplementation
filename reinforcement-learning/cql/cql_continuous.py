@@ -9,7 +9,7 @@ from tqdm.auto import trange
 import d4rl
 from library import pytorch_utils as ptu
 from library.gym_utils import verify_continuous_action_space, TransformObservationDtype
-from library.infrastructure.logger import EpochLogger, setup_logger_kwargs
+from library.infrastructure.logger import EpochLogger, setup_logger_kwargs, log
 from library.infrastructure.seeder import Seeder
 from library.infrastructure.tester import D4RLTester
 from library.infrastructure.timer import StopWatch
@@ -30,7 +30,7 @@ class CQLContinuousAgent(nn.Module):
                  q_lr=3e-4,
                  alpha=0.2,
                  alpha_lr=5e-3,
-                 alpha_cql=100.,
+                 alpha_cql=0.2,
                  alpha_cql_lr=5e-3,
                  tau=5e-3,
                  gamma=0.99,
@@ -283,6 +283,8 @@ def run_d4rl_cql(env_name: str,
     max_reward = np.max(dataset['rew'])
     min_reward = np.min(dataset['rew'])
     dataset['rew'] = (dataset['rew'] - min_reward) / (max_reward - min_reward)
+
+    log(f"Size of the dataset: {dataset['obs'].shape[0]}. Max reward: {max_reward}, Min reward: {min_reward}")
 
     agent = CQLContinuousAgent(env=env, policy_lr=policy_lr, policy_mlp_hidden=policy_mlp_hidden,
                                q_mlp_hidden=q_mlp_hidden, q_lr=q_lr, alpha=alpha,
