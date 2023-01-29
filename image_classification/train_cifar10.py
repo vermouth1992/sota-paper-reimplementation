@@ -5,6 +5,7 @@ Code modified from https://github.com/kuangliu/pytorch-cifar/blob/master/main.py
 import argparse
 import os
 
+import numpy as np
 import torch
 import torch.utils.data
 import torchvision
@@ -12,24 +13,13 @@ import torchvision.transforms as transforms
 from torch import nn, optim
 from tqdm.auto import tqdm
 
-from models import create_model, get_available_models
 from logger import setup_logger_kwargs, Logger
+from models import create_model, get_available_models
 
 TASK = 'cifar10'
 
 
-def main():
-    parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-    parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-    parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
-    parser.add_argument('--model', '-m', type=str, choices=get_available_models(TASK))
-    parser.add_argument('--total_epoch', type=int, help='Total number of epochs')
-    parser.add_argument('--enable_amp', action='store_true', help='enable amp')
-    parser.add_argument('--batch_size', type=int, help='Batch size', default=128)
-    parser.add_argument('--seed', type=int, default=4463)
-    parser.add_argument('--logger_dir', type=str, default='checkpoint')
-    args = vars(parser.parse_args())
-
+def main(args):
     model = args['model']
     resume = args['resume']
     lr = args['lr']
@@ -179,5 +169,112 @@ def main():
         logger.dump_tabular()
 
 
+def eval(args):
+    model = args['model']
+    logger_dir = args['logger_dir']
+    logger_dir = setup_logger_kwargs(exp_name=f'cifar10_{model}', seed=0,
+                                     data_dir=logger_dir, datestamp=False)
+    base_logger_dir = os.path.join(logger_dir['output_dir'], '..')
+    base_logger_dir = os.path.abspath(base_logger_dir)
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    testset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=transform_test)
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=100, shuffle=False, num_workers=2)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    nets = []
+
+    for file in os.listdir(base_logger_dir):
+        d = os.path.join(base_logger_dir, file)
+        if os.path.isdir(d):
+            checkpoint_path = os.path.join(d, 'ckpt.pth')
+            checkpoint = torch.load(checkpoint_path)
+            net = create_model(task=TASK, name=model)
+            net.load_state_dict(checkpoint['net'])
+            net.to(device)
+            net.eval()
+            nets.append(net)
+
+    criterion = nn.CrossEntropyLoss()
+
+    all_acc = []
+
+    for net in nets:
+        test_loss = 0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            t = tqdm(testloader)
+            for batch_idx, (inputs, targets) in enumerate(t):
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = net(inputs)
+                loss = criterion(outputs, targets)
+
+                test_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+
+                loss = test_loss / (batch_idx + 1)
+                acc = 100. * correct / total
+
+                message = f'Val Loss: {loss:.3f} | Val Acc: {acc:.2f} ({correct}/{total})'
+
+                t.set_description(message)
+            all_acc.append(acc)
+
+    print(f'Individual accuracy {np.mean(all_acc):.2f}±{np.std(all_acc):.2f}')
+
+    # ensemble prediction
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        t = tqdm(testloader)
+        for batch_idx, (inputs, targets) in enumerate(t):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            outputs_lst = []
+            for net in nets:
+                outputs = net(inputs)
+                outputs_lst.append(outputs)
+
+            outputs = torch.mean(torch.stack(outputs_lst, dim=-1), dim=-1)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+            acc = 100. * correct / total
+
+            message = f'Val Acc: {acc:.2f} ({correct}/{total})'
+
+            t.set_description(message)
+
+    print(f'Ensemble accuracy {acc}')
+
+
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
+    parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+    parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
+    parser.add_argument('--model', '-m', type=str, choices=get_available_models(TASK))
+    parser.add_argument('--total_epoch', type=int, help='Total number of epochs')
+    parser.add_argument('--enable_amp', action='store_true', help='enable amp')
+    parser.add_argument('--batch_size', type=int, help='Batch size', default=128)
+    parser.add_argument('--seed', type=int, default=4463)
+    parser.add_argument('--logger_dir', type=str, default='checkpoint')
+    parser.add_argument('--eval', action='store_true')
+    args = vars(parser.parse_args())
+
+    if args['eval']:
+        eval(args)
+    else:
+        main(args)
