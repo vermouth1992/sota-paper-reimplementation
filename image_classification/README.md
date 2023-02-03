@@ -8,11 +8,15 @@ educational purpose
 ### Cifar10
 
 ```bash
+# To see a list of implemented models
+python train_cifar10.py --help
 # Training
-python train_cifar10.py --model ResNet18 --total_epoch 200 --enable_amp --seed 4465;
+python train_cifar10.py --model {model} --total_epoch 200 --enable_amp --seed 4465;
 # Testing
-python train_cifar10.py --model ResNet50 --eval
+python train_cifar10.py --model {model} --eval
 ```
+
+Ensemble accuracy: take the average of the logits produced by the network (without log_softmax or softmax), then compute the predicted class according to the argmax.
 
 | Model    | Individual Model Accuracy | Ensemble Accuracy |
 |----------|-------                    |-------------------|
