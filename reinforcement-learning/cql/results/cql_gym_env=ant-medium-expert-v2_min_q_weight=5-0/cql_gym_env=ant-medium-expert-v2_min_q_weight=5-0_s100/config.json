@@ -1,0 +1,22 @@
+{
+    "alpha":	0.02,
+    "asynchronous":	false,
+    "batch_size":	256,
+    "behavior_cloning_epochs":	10,
+    "cql_threshold":	-1,
+    "env_name":	"ant-medium-expert-v2",
+    "epochs":	250,
+    "exp_name":	"cql_gym_env=ant-medium-expert-v2_min_q_weight=5-0",
+    "gamma":	0.99,
+    "logger_path":	"results",
+    "min_q_weight":	5.0,
+    "num_test_episodes":	30,
+    "policy_lr":	0.0001,
+    "policy_mlp_hidden":	256,
+    "q_lr":	0.0003,
+    "q_mlp_hidden":	256,
+    "seed":	100,
+    "steps_per_epoch":	4000,
+    "tau":	0.005,
+    "temperature":	1.0
+}

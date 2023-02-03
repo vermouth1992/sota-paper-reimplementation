@@ -1,0 +1,11 @@
+{
+    "batch_size":	128,
+    "enable_amp":	true,
+    "exp_name":	"cifar10_ResNet50",
+    "logger_dir":	"checkpoint",
+    "lr":	0.1,
+    "model":	"ResNet50",
+    "resume":	false,
+    "seed":	4463,
+    "total_epoch":	200
+}
