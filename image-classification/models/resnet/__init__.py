@@ -273,7 +273,7 @@ class ResNet(nn.Module):
         return self._forward_impl(x)
 
 
-from .registry import register_model
+from ..registry import register_model
 
 
 @register_model(task='imagenet', image_size=(3, 224, 224), num_classes=1000)
