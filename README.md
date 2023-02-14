@@ -1,4 +1,4 @@
-# Reimplementation of State-of-the-art Papers in one Desktop with one GPU
+# Reimplementation of State-of-the-art Papers on a Desktop with one GPU
 ## Motivation
 This repo contains reimplementation of a list of SOTA papers.
 For each algorithm, we implement:
