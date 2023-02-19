@@ -27,15 +27,21 @@ flags.DEFINE_float('replay_eviction', None, 'eviction of the Prioritized Replay 
 
 
 class ReplayManager(object):
-    def __init__(self, data_spec, seed):
+    def __init__(self, data_spec, seed,
+                 capacity,
+                 alpha,
+                 beta,
+                 eviction,
+                 update_after
+                 ):
         from library.replay_buffer import PrioritizedReplayBuffer
         self.replay_buffer = PrioritizedReplayBuffer(data_spec=data_spec,
-                                                     capacity=FLAGS.replay_capacity,
-                                                     alpha=FLAGS.replay_alpha,
-                                                     beta=FLAGS.replay_beta,
-                                                     eviction=FLAGS.replay_eviction,
+                                                     capacity=capacity,
+                                                     alpha=alpha,
+                                                     beta=beta,
+                                                     eviction=eviction,
                                                      seed=seed)
-        self.update_after = FLAGS.update_after
+        self.update_after = update_after
         self._global_env_step = 0
         self.start_time = None
 
@@ -45,7 +51,7 @@ class ReplayManager(object):
 
     def get_stats(self):
         return {
-            'Samples/s': self._global_env_step / (time.time() - self.start_time)
+            'Samples/s': self._global_env_step / (time.time() - self.start_time),
             'TotalEnvInteracts': self._global_env_step
         }
 
@@ -66,19 +72,24 @@ class ReplayManager(object):
 
 
 class Dataset(object):
-    def __init__(self, replay_buffer_actor):
+    def __init__(self, replay_buffer_actor, batch_size):
         self.replay_buffer_actor = replay_buffer_actor
+        self.batch_size = batch_size
 
-    def __call__(self, batch_size):
+    def __call__(self):
         while True:
-            yield ray.get(self.replay_buffer_actor.sample.remote(batch_size=batch_size))
+            yield ray.get(self.replay_buffer_actor.sample.remote(batch_size=self.batch_size))
 
 
 import tensorflow as tf
 
 
-def _convert_gym_space_to_tf_tensorspec(space: gym.spaces.Space):
-    return tf.TensorSpec(shape=space.shape, dtype=space.dtype)
+def _convert_gym_space_to_tf_tensorspec(space: gym.spaces.Space, batch_size):
+    if space.shape is None:
+        shape = ()
+    else:
+        shape = space.shape
+    return tf.TensorSpec(shape=(batch_size,) + tuple(shape), dtype=space.dtype)
 
 
 def _set_torch_threads_tf32(num_threads, allow_tf32=True):
@@ -93,31 +104,39 @@ flags.DEFINE_boolean('use_gpu_learner', default=True, help='Whether use GPU for 
 flags.DEFINE_integer('weight_push_freq', default=10, help='Frequency of learner pushes its weights')
 flags.DEFINE_integer('batch_size', default=256, help='Batch size for training')
 flags.DEFINE_integer('prefetch', default=5, help='Batch prefetch from ReplayManager')
-flags.DEFINE_integer('logging_freq', default=1000, help='Number of policy updates per logging')
+flags.DEFINE_integer('logging_freq', default=5000, help='Number of policy updates per logging')
 
 
 class Learner(object):
     def __init__(self,
                  make_agent_fn,
                  replay_manager,
-                 testing_queue: queue.Queue
+                 testing_queue: queue.Queue,
+                 num_cpus_learner,
+                 prefetch,
+                 batch_size,
+                 weight_push_freq,
+                 logging_freq
                  ):
         import tensorflow as tf
         import tensorflow_datasets as tfds
 
-        _set_torch_threads_tf32(FLAGS.num_cpus_learner, True)
+        _set_torch_threads_tf32(num_cpus_learner, True)
 
         self.agent = make_agent_fn()
         self.replay_manager = replay_manager
-        data_spec = self.replay_manager.data_spec.remote()
-        output_signature = {key: _convert_gym_space_to_tf_tensorspec(space) for key, space in data_spec.items()}
+        data_spec = ray.get(self.replay_manager.data_spec.remote())
+        output_signature = {key: _convert_gym_space_to_tf_tensorspec(space, batch_size)
+                            for key, space in data_spec.items()}
+        output_signature['weights'] = tf.TensorSpec(shape=(batch_size,), dtype=tf.float32)
+        output_signature = (tf.TensorSpec(shape=(), dtype=tf.int32), output_signature)
         print(output_signature)
-        self.dataset = tf.data.Dataset.from_generator(Dataset(self.replay_manager),
+        self.dataset = tf.data.Dataset.from_generator(Dataset(self.replay_manager, batch_size),
                                                       output_signature=output_signature
-                                                      ).prefetch(FLAGS.prefetch)
+                                                      ).prefetch(prefetch)
         self.dataset = tfds.as_numpy(self.dataset)
-        self.batch_size = FLAGS.batch_size
-        self.weight_push_freq = FLAGS.weight_push_freq
+        self.batch_size = batch_size
+        self.weight_push_freq = weight_push_freq
         self.policy_updates = 0
 
         from library.infrastructure.logger import EpochLogger
@@ -127,7 +146,7 @@ class Learner(object):
         self.store_weights()
 
         self.testing_queue = testing_queue
-        self.logging_freq = FLAGS.logging_freq
+        self.logging_freq = logging_freq
 
     def get_weights(self):
         return self.weights_id
@@ -178,20 +197,29 @@ flags.DEFINE_integer('local_capacity', default=1000, help='Number of environment
 
 
 class Actor(object):
-    def __init__(self, make_agent_fn, env_train_fn, learner, replay_manager, seed):
-        _set_torch_threads_tf32(FLAGS.num_cpus_actor, True)
+    def __init__(self, make_agent_fn, env_train_fn, learner, replay_manager, seed,
+                 num_cpus_actor,
+                 weight_update_freq,
+                 local_capacity,
+                 n_steps,
+                 gamma,
+                 ):
+        _set_torch_threads_tf32(num_cpus_actor, True)
 
         self.agent = make_agent_fn()
         self.agent.eval()
         self.learner = learner
         self.replay_manager = replay_manager
-        self.weight_update_freq = FLAGS.weight_update_freq
-        self.local_capacity = FLAGS.local_capacity
-        self.sampler = BatchSampler(env=env_train_fn(), n_steps=FLAGS.n_steps, gamma=FLAGS.gamma, seed=seed)
+        self.weight_update_freq = weight_update_freq
+        self.local_capacity = local_capacity
+        self.sampler = BatchSampler(env=env_train_fn(), n_steps=n_steps, gamma=gamma, seed=seed)
 
         from library.infrastructure.logger import EpochLogger
+        from library.replay_buffer.replay_buffer import PyDictStorage
         self.logger = EpochLogger()
         self.sampler.set_logger(self.logger)
+        data_spec = ray.get(self.replay_manager.data_spec.remote())
+        self.local_storage = PyDictStorage(data_spec=data_spec, capacity=local_capacity)
 
     def get_stats(self):
         stats = self.logger.get_epoch_dict()
@@ -207,34 +235,20 @@ class Actor(object):
         replay_manager = self.replay_manager
         replay_manager.add.remote(data, priority)
 
-    def reset_local_data(self):
-        self.local_data = {
-            'obs': [],
-            'act': [],
-            'next_obs': [],
-            'rew': [],
-            'done': [],
-            'gamma': []
-        }
-
-    def append_to_local_data(self, data):
-        for key, val in data:
-            self.local_data[key].append(val)
-
     def train(self):
         self.update_weights()
         self.sampler.reset()
         local_steps = 0
-        self.reset_local_data()
-        collect_fn = lambda o: self.agent.act_batch_explore(np.expand_dims(o, dim=-1), None)[0]
+        collect_fn = lambda o: self.agent.act_batch_explore(np.expand_dims(o, axis=0), None)[0]
         for data in self.sampler.sample(collect_fn=collect_fn):
-            self.append_to_local_data(data)
-            local_steps += 1
-            if local_steps % self.local_capacity == 0:
-                data = {key: np.stack(val, axis=0) for key, val in self.local_data.items()}
+            data = {key: np.expand_dims(val, axis=0) for key, val in data.items()}
+            self.local_storage.add(data=data)
+
+            if self.local_storage.is_full():
+                data = self.local_storage.get()
                 priority = self.agent.compute_priority(data)
                 self.add_local_to_global(data, priority)
-                self.reset_local_data()
+                self.local_storage.reset()
 
             if local_steps % self.weight_update_freq == 0:
                 self.update_weights()
@@ -249,7 +263,7 @@ flags.DEFINE_integer('total_num_policy_updates', default=1000000, help='Total nu
 flags.DEFINE_integer('num_test_episodes', default=30, help='Number of test episodes')
 flags.DEFINE_string('logger_path', default=None, help='Logger path')
 flags.DEFINE_integer('seed', default=100, help='Global seed')
-flags.DEFINE_float('exp_name', default=None, help='Name of the experience')
+flags.DEFINE_string('exp_name', default=None, help='Name of the experience')
 
 
 class Logger(object):
@@ -329,7 +343,7 @@ class Logger(object):
             self.logger.log_tabular('Samples/s', sampling_throughput)
             self.logger.log_tabular('PolicyUpdates', num_policy_updates)
             self.logger.log_tabular('GradientSteps/s', training_throughput)
-            self.logger.log_tabular('Estimated Time (h)', estimated_finish_time / 3600)
+            self.logger.log_tabular('Remaining Time (h)', estimated_finish_time / 3600)
             self.logger.dump_tabular()
 
             if num_policy_updates >= self.total_num_policy_updates:
@@ -358,8 +372,13 @@ def run_apex(argv):
 
     from library.gym_utils import TransformObservationDtype
 
+    env_name = FLAGS.env_name
+
+    if FLAGS.exp_name is None:
+        FLAGS.set_default('exp_name', f'apex_continuous_{env_name}')
+
     def env_fn_train():
-        env = gym.make(FLAGS.env_name)
+        env = gym.make(env_name)
         env = TransformObservationDtype(env, dtype=np.float32)
         env = gym.wrappers.RescaleAction(env, min_action=-1., max_action=1.)
         return env
@@ -371,17 +390,30 @@ def run_apex(argv):
     # create replay manager
     from library.replay_buffer.replay_buffer import get_data_spec_from_env
     replay_manager = ReplayManager_remote.remote(data_spec=get_data_spec_from_env(dummy_env),
-                                                 seed=seeder.generate_seed())
+                                                 seed=seeder.generate_seed(),
+                                                 capacity=FLAGS.replay_capacity,
+                                                 alpha=FLAGS.replay_alpha,
+                                                 beta=FLAGS.replay_beta,
+                                                 eviction=FLAGS.replay_eviction,
+                                                 update_after=FLAGS.update_after
+                                                 )
 
     # make queues
     testing_queue = queue.Queue(maxsize=3)
 
-    make_agent_fn = lambda: SACAgent(dummy_env, target_entropy_per_dim=FLAGS.sac_target_entropy_per_dim)
+    target_entropy_per_dim = FLAGS.sac_target_entropy_per_dim
+    make_agent_fn = lambda: SACAgent(dummy_env, target_entropy_per_dim=target_entropy_per_dim)
 
     # create learners
     learner = Learner_remote.remote(make_agent_fn=make_agent_fn,
                                     replay_manager=replay_manager,
-                                    testing_queue=testing_queue)
+                                    testing_queue=testing_queue,
+                                    num_cpus_learner=FLAGS.num_cpus_learner,
+                                    prefetch=FLAGS.prefetch,
+                                    batch_size=FLAGS.batch_size,
+                                    weight_push_freq=FLAGS.weight_push_freq,
+                                    logging_freq=FLAGS.logging_freq
+                                    )
 
     # create actors
     actors = [Actor_remote.remote(
@@ -389,7 +421,13 @@ def run_apex(argv):
         env_train_fn=env_fn_train,
         learner=learner,
         replay_manager=replay_manager,
-        seed=seeder.generate_seed()) for _ in range(FLAGS.num_actors)]
+        seed=seeder.generate_seed(),
+        num_cpus_actor=FLAGS.num_cpus_actor,
+        weight_update_freq=FLAGS.weight_update_freq,
+        local_capacity=FLAGS.local_capacity,
+        n_steps=FLAGS.n_steps,
+        gamma=FLAGS.gamma
+    ) for _ in range(FLAGS.num_actors)]
 
     logger = Logger(
         receive_queue=testing_queue,
@@ -398,7 +436,8 @@ def run_apex(argv):
         make_test_agent_fn=make_agent_fn,
         env_fn_test=env_fn_test,
         tester_seed=seeder.generate_seed(),
-        config=config
+        config=config,
+        replay_manager=replay_manager
     )
 
     # start to run actors

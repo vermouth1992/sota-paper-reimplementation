@@ -105,7 +105,7 @@ class SACAgent(nn.Module):
         data = ptu.convert_dict_to_tensor(data, device=self.device)
         return ptu.to_numpy(self.compute_priority_torch(**data))
 
-    def train_on_batch_torch(self, obs, act, next_obs, done, rew, gamma):
+    def train_on_batch_torch(self, obs, act, next_obs, done, rew, gamma, weights=None):
         """ Sample a mini-batch from replay buffer and update the network
         Args:
             obs: (batch_size, ob_dim)
@@ -129,6 +129,9 @@ class SACAgent(nn.Module):
         # (num_ensembles, None)
         q_values_loss = torch.sum(q_values_loss, dim=0)  # (None,)
         # apply importance weights
+        if weights is not None:
+            q_values_loss = q_values_loss * weights
+
         q_values_loss = torch.mean(q_values_loss)
         self.q_optimizer.zero_grad()
         q_values_loss.backward()
@@ -150,7 +153,7 @@ class SACAgent(nn.Module):
 
         with torch.no_grad():
             td_error = torch.abs(delta_q)  # (num_ensembles, None)
-            td_error = torch.mean(td_error)  # (None,)
+            td_error = torch.mean(td_error, dim=0)  # (None,)
 
         info = dict(
             LogPi=log_prob,
@@ -171,6 +174,7 @@ class SACAgent(nn.Module):
         info = self.train_on_batch_torch(**data)
         self.update_target()
         self.logger.store(**info)
+        return info
 
     def act_batch_torch(self, obs, deterministic):
         with torch.no_grad():
