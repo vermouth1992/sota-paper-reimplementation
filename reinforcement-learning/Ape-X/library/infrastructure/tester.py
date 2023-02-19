@@ -18,6 +18,9 @@ class Tester(object):
         self.seed = seed
         self.logger = None
 
+    def set_logger(self, logger):
+        self.logger = logger
+
     def log_tabular(self):
         assert self.logger is not None
         self.logger.log_tabular('TestEpRet', with_min_and_max=True)
