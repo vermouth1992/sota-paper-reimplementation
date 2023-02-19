@@ -12,6 +12,10 @@ def convert_dict_to_tensor(data, device=None):
     return tensor_data
 
 
+def to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.detach().cpu().numpy()
+
+
 def get_accelerator(id=None):
     if not torch.cuda.is_available():
         print('Cuda is not available. Using cpu.')

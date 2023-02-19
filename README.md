@@ -1,5 +1,4 @@
-# Reimplementation of State-of-the-art Papers
-
+# Reimplementation of State-of-the-art Papers on a Desktop with one GPU
 ## Motivation
 
 This repo contains reimplementation of a list of SOTA papers.
@@ -30,3 +29,4 @@ This causes rewriting codes with similar functionalities many times in various a
 ### Reinforcement Learning
 
 - Distributed Prioritized Experience Replay: 
+

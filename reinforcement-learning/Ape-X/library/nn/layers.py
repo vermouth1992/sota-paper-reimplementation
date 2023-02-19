@@ -59,18 +59,20 @@ class EnsembleLinear(nn.Module):
             self.register_parameter('bias', None)
         self.reset_parameters()
 
-    def reset_parameters(self) -> None:
-        fan = self.in_features
-        gain = nn.init.calculate_gain('leaky_relu', param=math.sqrt(5))
-        std = gain / math.sqrt(fan)
-        bound = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
-        with torch.no_grad():
-            nn.init.uniform_(self.weight, -bound, bound)
+    def reset_parameters_linear(self, weight, bias):
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
+        # https://github.com/pytorch/pytorch/issues/57109
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+        if bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(bias, -bound, bound)
 
-        if self.bias is not None:
-            fan_in = self.in_features
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
+    def reset_parameters(self) -> None:
+        for i in range(self.num_ensembles):
+            bias = self.bias[i, 0] if self.bias is not None else None
+            self.reset_parameters_linear(self.weight[i], bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return torch.bmm(input, self.weight) + self.bias
@@ -110,3 +112,29 @@ class LambdaLayer(nn.Module):
 
     def forward(self, x):
         return self.function(x)
+
+
+if __name__ == '__main__':
+    # verify EnsembleLinear vs. Linear output and gradients
+    ensemble_linear = EnsembleLinear(num_ensembles=2, in_features=5, out_features=10)
+    linear1 = nn.Linear(in_features=5, out_features=10)
+    linear2 = nn.Linear(in_features=5, out_features=10)
+    linear1.weight.data.copy_(ensemble_linear.weight.data[0].T)
+    linear1.bias.data.copy_(ensemble_linear.bias.data[0, 0])
+    linear2.weight.data.copy_(ensemble_linear.weight.data[1].T)
+    linear2.bias.data.copy_(ensemble_linear.bias.data[1, 0])
+
+    fake_data = torch.randn(100, 5)
+    ensemble_output = ensemble_linear(torch.tile(torch.unsqueeze(fake_data, dim=0), dims=(2, 1, 1)))
+    output1 = linear1(fake_data)
+    output2 = linear2(fake_data)
+    output = torch.stack((output1, output2), dim=0)
+    torch.testing.assert_close(output, ensemble_output)
+
+    ensemble_output.mean().backward()
+    ((output1 + output2) / 2.).mean().backward()
+
+    torch.testing.assert_close(linear1.weight.grad, ensemble_linear.weight.grad[0].T)
+    torch.testing.assert_close(linear2.weight.grad, ensemble_linear.weight.grad[1].T)
+    torch.testing.assert_close(linear1.bias.grad, ensemble_linear.bias.grad[0, 0])
+    torch.testing.assert_close(linear2.bias.grad, ensemble_linear.bias.grad[1, 0])

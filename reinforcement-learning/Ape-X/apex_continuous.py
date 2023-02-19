@@ -3,33 +3,45 @@ Implement parallel SPO using ray.
 The logging is done by the number of policy updates
 """
 
+import os
 import threading
-from typing import Dict
-import numpy as np
-import collections
-import ray
 import time
+from typing import Dict
 
-import library
+import gym
+import numpy as np
+import ray
+from absl import flags, app
 from ray.util import queue
-from typing import List
 
 import library.pytorch_utils as ptu
-
-from rlutils import logx
-
-from absl import flags
+from library.infrastructure import logger as logx
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('num_cpus_replay', 1, 'Number of cpus used for ReplayManager')
 flags.DEFINE_integer('update_after', 10000, 'Number of environment steps before update begins')
+flags.DEFINE_integer('replay_capacity', 1000000, 'Capacity of the replay buffer')
+flags.DEFINE_float('replay_alpha', 0.6, 'alpha of the Prioritized Replay Buffer')
+flags.DEFINE_float('replay_beta', 0.4, 'beta of the Prioritized Replay Buffer')
+flags.DEFINE_float('replay_eviction', None, 'eviction of the Prioritized Replay Buffer')
 
 
 @ray.remote(num_cpus=FLAGS.num_cpus_replay)
 class ReplayManager(object):
-    def __init__(self, make_replay_fn,
+    def __init__(self,
+                 data_spec,
+                 capacity=FLAGS.replay_capacity,
+                 alpha=FLAGS.replay_alpha,
+                 beta=FLAGS.replay_beta,
+                 eviction=FLAGS.replay_eviction,
                  update_after=FLAGS.update_after):
-        self.replay_buffer = make_replay_fn()
+        from library.replay_buffer import PrioritizedReplayBuffer
+        self.replay_buffer = PrioritizedReplayBuffer(data_spec=data_spec,
+                                                     capacity=capacity,
+                                                     alpha=alpha,
+                                                     beta=beta,
+                                                     eviction=eviction,
+                                                     seed=None)
         self.update_after = update_after
 
     def sample(self, batch_size):
@@ -45,6 +57,9 @@ class ReplayManager(object):
     def add(self, data: Dict[str, np.ndarray], priority=None):
         self.replay_buffer.add(data, priority)
 
+    def data_spec(self):
+        return self.replay_buffer.data_spec
+
 
 class Dataset(object):
     def __init__(self, replay_buffer_actor):
@@ -55,11 +70,26 @@ class Dataset(object):
             yield ray.get(self.replay_buffer_actor.sample.remote(batch_size=batch_size))
 
 
+import tensorflow as tf
+
+
+def _convert_gym_space_to_tf_tensorspec(space: gym.spaces.Space):
+    return tf.TensorSpec(shape=space.shape, dtype=space.dtype)
+
+
+def _set_torch_threads_tf32(num_threads, allow_tf32=True):
+    import torch
+    torch.set_num_threads(num_threads)
+    import torch.backends.cuda
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+
 flags.DEFINE_integer('num_cpus_learner', default=1, help='Number of CPUs per learner')
 flags.DEFINE_boolean('use_gpu_learner', default=True, help='Whether use GPU for the learner')
 flags.DEFINE_integer('weight_push_freq', default=10, help='Frequency of learner pushes its weights')
 flags.DEFINE_integer('batch_size', default=256, help='Batch size for training')
 flags.DEFINE_integer('prefetch', default=5, help='Batch prefetch from ReplayManager')
+flags.DEFINE_integer('logging_freq', default=1000, help='Number of ')
 
 
 @ray.remote(num_cpus=FLAGS.num_cpus_learner, num_gpus=1 if FLAGS.use_gpu_learner else 0)
@@ -67,27 +97,25 @@ class Learner(object):
     def __init__(self,
                  make_agent_fn,
                  replay_manager,
-                 actor_critic,
+                 testing_queue: queue.Queue,
                  weight_push_freq=FLAGS.weight_push_freq,
                  batch_size=FLAGS.batch_size,
                  prefetch=FLAGS.prefetch,
                  num_threads=FLAGS.num_cpus_learner,
-                 testing_queue: queue.Queue = None,
-                 logging_freq=None,
+                 logging_freq=FLAGS.logging_freq,
                  ):
-        import torch
         import tensorflow as tf
         import tensorflow_datasets as tfds
 
-        torch.set_num_threads(num_threads)
+        _set_torch_threads_tf32(num_threads, True)
 
         self.agent = make_agent_fn()
-        self.actor_critic = actor_critic
         self.replay_manager = replay_manager
+        data_spec = self.replay_manager.data_spec.remote()
+        output_signature = {key: _convert_gym_space_to_tf_tensorspec(space) for key, space in data_spec.items()}
+        print(output_signature)
         self.dataset = tf.data.Dataset.from_generator(Dataset(self.replay_manager),
-                                                      output_signature=dict(
-
-                                                      )
+                                                      output_signature=output_signature
                                                       ).prefetch(prefetch)
         self.dataset = tfds.as_numpy(self.dataset)
         self.batch_size = batch_size
@@ -123,8 +151,8 @@ class Learner(object):
         start = time.time()
         for transaction_id, data in self.dataset:
             info = self.agent.train_on_batch(data)
-            self.replay_manager.update_priorities.remote(transaction_id,
-                                                         info['TDError'].cpu().numpy())
+            td_error = ptu.to_numpy(info['TDError'])
+            self.replay_manager.update_priorities.remote(transaction_id, td_error)
             self.policy_updates += 1
 
             # push weights
@@ -142,26 +170,24 @@ class Learner(object):
                     logx.log('Testing queue is full. Skip this epoch', color='red')
 
 
+flags.DEFINE_integer('num_cpus_actor', default=1, help='Number of CPUs per actor')
 
 
-
+@ray.remote(num_cpus=FLAGS.num_cpus_actor, num_gpus=0)
 class Actor(object):
     def __init__(self,
                  make_agent_fn,
-                 make_sampler_fn,
-                 make_local_buffer_fn,
-                 weight_server_lst,
-                 replay_manager_lst,
+                 learner,
+                 replay_manager,
                  weight_update_freq=100,
                  num_threads=1,
                  ):
-        import torch
-        torch.set_num_threads(num_threads)
+        _set_torch_threads_tf32(num_threads, True)
 
         self.agent = make_agent_fn()
         self.agent.eval()
-        self.weight_server_lst = weight_server_lst
-        self.replay_manager_lst = replay_manager_lst
+        self.learner = learner
+        self.replay_manager = replay_manager
         self.weight_update_freq = weight_update_freq
         self.sampler = make_sampler_fn()
         self.local_buffer = make_local_buffer_fn()
@@ -206,6 +232,7 @@ class Actor(object):
         while True:
             self.sampler.sample(num_steps=1, collect_fn=lambda o: self.agent.act_batch_explore(o, None),
                                 replay_buffer=self.local_buffer)
+
             local_steps += 1
             if self.local_buffer.is_full():
                 data = self.local_buffer.storage.get()
@@ -237,8 +264,7 @@ class Logger(object):
                  seed,
                  logger_path,
                  config):
-        import torch
-        torch.set_num_threads(num_cpus_tester)
+        _set_torch_threads_tf32(num_threads=num_cpus_tester, allow_tf32=True)
         # modules
         self.receive_queue = receive_queue
         self.logging_freq = logging_freq
@@ -312,70 +338,34 @@ class Logger(object):
                 break
 
 
-def run_spo(make_local_learner_fn_lst,  # used for each learner
-            make_test_agent_fn,
-            make_sampler_fn,
-            make_local_buffer_fn,
-            make_actor_fn_lst,
-            make_replay_fn,
-            make_tester_fn,
-            exp_name,
-            config=None,
-            # actor args
-            num_cpus_per_actor=1,
-            num_actors=4,
-            weight_update_freq=20,
-            # learner args
-            num_learners=1,
-            num_cpus_per_learner=1,
-            num_gpus_per_learner=1,
-            batch_size=256,
-            weight_push_freq=10,
-            update_after=10000,
-            sync_freq=10,
-            target_update_freq=100,
-            actor_critic=False,
-            averaging_device=None,
-            # logging
-            total_num_policy_updates=1000000,
-            logging_freq=10000,
-            num_test_episodes=30,
-            num_cpus_tester=4,
-            num_gpus_tester=0,
-            logger_path: str = None,
-            seed=1,
-            ):
-    # argument checking
-    assert batch_size % num_learners == 0
-    assert num_actors % num_learners == 0 or num_learners % num_actors == 0
+flags.DEFINE_string('env_name', default='Humanoid-v4', required=True, help='Environment name')
 
+
+def run_apex(argv):
     if config is None:
         config = locals()
 
-    import os
-    import torch
-    torch.set_num_threads(num_cpus_per_learner)
-
-    total_cpus = os.cpu_count()
-
-    print(f'Total number of CPUs: {total_cpus}, Actor usage: {num_actors * num_cpus_per_actor}, '
-          f'Learner usage: {num_cpus_per_learner * num_learners}, Tester usage: {num_cpus_tester}')
-
-    Actor_remote = ray.remote(num_cpus=num_cpus_per_actor)(Actor)
-    Learner_remote = ray.remote(num_cpus=num_cpus_per_learner, num_gpus=num_gpus_per_learner)(Learner)
-    ReplayManager_remote = ray.remote(num_cpus=1)(ReplayManager)
+    print(f'Total number of cpus {os.cpu_count()}')
 
     ray.init()
 
     # create replay manager
-    num_replay_managers = num_learners
-    replay_manager_lst = [ReplayManager_remote.remote(make_replay_fn=make_replay_fn,
-                                                      update_after=update_after // num_replay_managers)
-                          for _ in range(num_replay_managers)]
+
+    from library.gym_utils import TransformObservationDtype
+
+    def env_fn_train():
+        env = gym.make(FLAGS.env_name)
+        env = TransformObservationDtype(env, dtype=np.float32)
+        env = gym.wrappers.RescaleAction(env, min_action=-1., max_action=1.)
+        return env
+
+    env_fn_test = env_fn_train
+
+    # create replay buffer
+    from library.replay_buffer.replay_buffer import get_data_spec_from_env
+    replay_manager = ReplayManager.remote(data_spec=get_data_spec_from_env(env_fn_train()))
 
     # make queues
-    learner_push_queue = queue.Queue() if num_learners > 1 else None
-    learner_receive_queues = [queue.Queue() for _ in range(num_learners - 1)]
     testing_queue = queue.Queue(maxsize=3)
 
     # create learners
@@ -480,3 +470,7 @@ def run_spo(make_local_learner_fn_lst,  # used for each learner
     logger.log()
 
     ray.shutdown()
+
+
+if __name__ == '__main__':
+    app.run(run_apex)

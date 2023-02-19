@@ -17,7 +17,7 @@ from gym import spaces
 class TransformObservationDtype(gym.wrappers.TransformObservation):
     def __init__(self, env: gym.Env, dtype):
         super(TransformObservationDtype, self).__init__(env, f=lambda x: x.astype(dtype))
-        assert isinstance(env.observation_space, spaces.Box)
+        assert isinstance(self.env.observation_space, spaces.Box)
         self.observation_space = spaces.Box(low=self.env.observation_space.low,
                                             high=self.env.observation_space.high,
                                             shape=self.env.observation_space.shape,
