@@ -2,11 +2,11 @@
 Implement parallel SPO using ray.
 The logging is done by the number of policy updates
 """
-
+import collections
 import os
 import threading
 import time
-from typing import Dict
+from typing import Dict, List
 
 import gym
 import numpy as np
@@ -28,11 +28,15 @@ flags.DEFINE_float('replay_eviction', None, 'eviction of the Prioritized Replay 
 
 class ReplayManager(object):
     def __init__(self, data_spec, seed,
+                 actor_data_queues: List[queue.Queue],
+                 learner_data_queue: queue.Queue,
+                 priority_data_queue: queue.Queue,
                  capacity,
                  alpha,
                  beta,
                  eviction,
-                 update_after
+                 update_after,
+                 batch_size
                  ):
         from library.replay_buffer import PrioritizedReplayBuffer
         self.replay_buffer = PrioritizedReplayBuffer(data_spec=data_spec,
@@ -44,6 +48,11 @@ class ReplayManager(object):
         self.update_after = update_after
         self._global_env_step = 0
         self.start_time = None
+        self.actor_data_queues = actor_data_queues
+        self.learner_data_queue = learner_data_queue
+        self.priority_data_queue = priority_data_queue
+        self.batch_size = batch_size
+        self.sampled_data = collections.deque(maxlen=5)
 
     def sample(self, batch_size):
         data = self.replay_buffer.sample(batch_size)
@@ -70,15 +79,43 @@ class ReplayManager(object):
     def data_spec(self):
         return self.replay_buffer.data_spec
 
+    def main(self):
+        while True:
+            for actor_data_queue in self.actor_data_queues:
+                try:
+                    data, priority = actor_data_queue.get(block=False)
+                    self.add(data, priority)
+                except queue.Empty:
+                    pass
+
+            if self.ready()[0]:
+                if len(self.sampled_data) == 0:
+                    data = self.sample(batch_size=self.batch_size)
+                else:
+                    data = self.sampled_data.popleft()
+                try:
+                    self.learner_data_queue.put(data, block=False)
+                except queue.Full:
+                    self.sampled_data.append(data)
+
+                try:
+                    transaction_id, priorities = self.priority_data_queue.get(block=False)
+                    self.update_priorities(transaction_id, priorities)
+                except queue.Empty:
+                    pass
+
+    def run(self):
+        background_thread = threading.Thread(target=self.main, daemon=True)
+        background_thread.start()
+
 
 class Dataset(object):
-    def __init__(self, replay_buffer_actor, batch_size):
-        self.replay_buffer_actor = replay_buffer_actor
-        self.batch_size = batch_size
+    def __init__(self, learner_data_queue: queue.Queue):
+        self.learner_data_queue = learner_data_queue
 
     def __call__(self):
         while True:
-            yield ray.get(self.replay_buffer_actor.sample.remote(batch_size=self.batch_size))
+            yield self.learner_data_queue.get(block=True)
 
 
 import tensorflow as tf
@@ -103,7 +140,7 @@ flags.DEFINE_integer('num_cpus_learner', default=1, help='Number of CPUs per lea
 flags.DEFINE_boolean('use_gpu_learner', default=True, help='Whether use GPU for the learner')
 flags.DEFINE_integer('weight_push_freq', default=10, help='Frequency of learner pushes its weights')
 flags.DEFINE_integer('batch_size', default=256, help='Batch size for training')
-flags.DEFINE_integer('prefetch', default=5, help='Batch prefetch from ReplayManager')
+flags.DEFINE_integer('prefetch', default=10, help='Batch prefetch from ReplayManager')
 flags.DEFINE_integer('logging_freq', default=5000, help='Number of policy updates per logging')
 
 
@@ -116,7 +153,9 @@ class Learner(object):
                  prefetch,
                  batch_size,
                  weight_push_freq,
-                 logging_freq
+                 logging_freq,
+                 learner_data_queue: queue.Queue,
+                 priority_data_queue: queue.Queue,
                  ):
         import tensorflow as tf
         import tensorflow_datasets as tfds
@@ -125,13 +164,15 @@ class Learner(object):
 
         self.agent = make_agent_fn()
         self.replay_manager = replay_manager
+        self.learner_data_queue = learner_data_queue
+        self.priority_data_queue = priority_data_queue
         data_spec = ray.get(self.replay_manager.data_spec.remote())
         output_signature = {key: _convert_gym_space_to_tf_tensorspec(space, batch_size)
                             for key, space in data_spec.items()}
         output_signature['weights'] = tf.TensorSpec(shape=(batch_size,), dtype=tf.float32)
         output_signature = (tf.TensorSpec(shape=(), dtype=tf.int32), output_signature)
         print(output_signature)
-        self.dataset = tf.data.Dataset.from_generator(Dataset(self.replay_manager, batch_size),
+        self.dataset = tf.data.Dataset.from_generator(Dataset(self.learner_data_queue),
                                                       output_signature=output_signature
                                                       ).prefetch(prefetch)
         self.dataset = tfds.as_numpy(self.dataset)
@@ -169,7 +210,7 @@ class Learner(object):
         for transaction_id, data in self.dataset:
             info = self.agent.train_on_batch(data)
             td_error = ptu.to_numpy(info['TDError'])
-            self.replay_manager.update_priorities.remote(transaction_id, td_error)
+            self.priority_data_queue.put(item=(transaction_id, td_error), block=True)
             self.policy_updates += 1
 
             # push weights
@@ -203,6 +244,7 @@ class Actor(object):
                  local_capacity,
                  n_steps,
                  gamma,
+                 actor_data_queue: queue.Queue,
                  ):
         _set_torch_threads_tf32(num_cpus_actor, True)
 
@@ -220,6 +262,7 @@ class Actor(object):
         self.sampler.set_logger(self.logger)
         data_spec = ray.get(self.replay_manager.data_spec.remote())
         self.local_storage = PyDictStorage(data_spec=data_spec, capacity=local_capacity)
+        self.actor_data_queue = actor_data_queue
 
     def get_stats(self):
         stats = self.logger.get_epoch_dict()
@@ -231,9 +274,7 @@ class Actor(object):
         background_thread.start()
 
     def add_local_to_global(self, data, priority):
-        # pick a random replay manager
-        replay_manager = self.replay_manager
-        replay_manager.add.remote(data, priority)
+        self.actor_data_queue.put(item=(data, priority), block=True)
 
     def train(self):
         self.update_weights()
@@ -387,6 +428,12 @@ def run_apex(argv):
 
     dummy_env = env_fn_train()
 
+    # make queues
+    testing_queue = queue.Queue(maxsize=3)
+    actor_data_queues = [queue.Queue(maxsize=100) for _ in range(FLAGS.num_actors)]
+    learner_data_queue = queue.Queue(maxsize=10)
+    priority_data_queue = queue.Queue(maxsize=10)
+
     # create replay manager
     from library.replay_buffer.replay_buffer import get_data_spec_from_env
     replay_manager = ReplayManager_remote.remote(data_spec=get_data_spec_from_env(dummy_env),
@@ -395,11 +442,12 @@ def run_apex(argv):
                                                  alpha=FLAGS.replay_alpha,
                                                  beta=FLAGS.replay_beta,
                                                  eviction=FLAGS.replay_eviction,
-                                                 update_after=FLAGS.update_after
+                                                 update_after=FLAGS.update_after,
+                                                 actor_data_queues=actor_data_queues,
+                                                 learner_data_queue=learner_data_queue,
+                                                 priority_data_queue=priority_data_queue,
+                                                 batch_size=FLAGS.batch_size
                                                  )
-
-    # make queues
-    testing_queue = queue.Queue(maxsize=3)
 
     target_entropy_per_dim = FLAGS.sac_target_entropy_per_dim
     make_agent_fn = lambda: SACAgent(dummy_env, target_entropy_per_dim=target_entropy_per_dim)
@@ -412,7 +460,9 @@ def run_apex(argv):
                                     prefetch=FLAGS.prefetch,
                                     batch_size=FLAGS.batch_size,
                                     weight_push_freq=FLAGS.weight_push_freq,
-                                    logging_freq=FLAGS.logging_freq
+                                    logging_freq=FLAGS.logging_freq,
+                                    learner_data_queue=learner_data_queue,
+                                    priority_data_queue=priority_data_queue
                                     )
 
     # create actors
@@ -426,8 +476,9 @@ def run_apex(argv):
         weight_update_freq=FLAGS.weight_update_freq,
         local_capacity=FLAGS.local_capacity,
         n_steps=FLAGS.n_steps,
-        gamma=FLAGS.gamma
-    ) for _ in range(FLAGS.num_actors)]
+        gamma=FLAGS.gamma,
+        actor_data_queue=actor_data_queues[i]
+    ) for i in range(FLAGS.num_actors)]
 
     logger = Logger(
         receive_queue=testing_queue,
@@ -443,6 +494,9 @@ def run_apex(argv):
     # start to run actors
     for actor in actors:
         actor.run.remote()
+
+    # start to run replay manager
+    replay_manager.run.remote()
 
     # wait for replay buffer warmup
     while True:
